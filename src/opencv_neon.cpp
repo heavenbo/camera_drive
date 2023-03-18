@@ -47,7 +47,7 @@ double left_intrinsics[9], right_intrinsics[9], cam_r[9];
 double right_distortion[4], left_distortion[4];
 double left_p[12], right_p[12];
 double exposure_t, gamma_ratio, bal_r, bal_g, bal_b, gain;
-int control_mode, frequency, resolution;
+int control_mode, frequency, resolution,iscolor;
 std::string camera_style;
 uint32_t height, width;
 sensor_msgs::CameraInfo cam_left, cam_right;
@@ -163,6 +163,7 @@ void yaml_read(std::string file_path)
 
     YAML::Node yaml_node = YAML::LoadFile(file_path);
     camera_style = yaml_node["Camera_style"].as<std::string>();
+    iscolor = yaml_node["Iscolor"].as<int>();
     control_mode = yaml_node["Control_mode"].as<int>();
     frequency = yaml_node["Frequency"].as<int>();
     resolution = yaml_node["Resolution"].as<int>();
