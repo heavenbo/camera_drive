@@ -1,0 +1,25 @@
+Control_mode: 1 #0为帧率控制，1为pwm控制
+Frequency: 30
+Exposure_T: 10000.0
+Gamma: 2.0
+Resolution: 0 #0为640*512 1为1280*1024
+iscolor: 0 #0开启彩图，1关闭彩图
+Balance_ratio:
+  r: 0.988648
+  g: 1.0
+  b: 1.424984
+Gain: 0
+Camera_style: ann
+Left_cam:
+  intrinsics: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  distortion: [1, 2, 3, 4]
+  Cam_p: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] #Tx=Ty=0
+Right_cam:
+  intrinsics: [0, 0, 0, 0, 0, 0, 0, 0, 0]
+  distortion: [0, 0, 0, 0]
+  Cam_p: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  #P =[fx'  0  cx' Tx]
+  #   [ 0  fy' cy' Ty]
+  #   [ 0   0   1   0]
+  #   Ty=0;Tx=-fx*B
+Cam_r: [1, 0, 0, 0, 1, 0, 0, 0, 1]
