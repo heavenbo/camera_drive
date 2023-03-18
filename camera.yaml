@@ -3,7 +3,7 @@ Frequency: 30
 Exposure_T: 10000.0
 Gamma: 2.0
 Resolution: 0 #0为640*512 1为1280*1024
-iscolor: 0 #0开启彩图，1关闭彩图
+Iscolor: 0 #0开启彩图，1关闭彩图
 Balance_ratio:
   r: 0.988648
   g: 1.0
