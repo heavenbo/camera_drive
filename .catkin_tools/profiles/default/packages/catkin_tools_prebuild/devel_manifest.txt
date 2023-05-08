@@ -1,0 +1,13 @@
+/home/oem/Vscode/work/cam/build/catkin_tools_prebuild
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/local_setup.bash /home/oem/Vscode/work/cam/devel/./local_setup.bash
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/local_setup.sh /home/oem/Vscode/work/cam/devel/./local_setup.sh
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/cmake.lock /home/oem/Vscode/work/cam/devel/./cmake.lock
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/setup.sh /home/oem/Vscode/work/cam/devel/./setup.sh
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/_setup_util.py /home/oem/Vscode/work/cam/devel/./_setup_util.py
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/env.sh /home/oem/Vscode/work/cam/devel/./env.sh
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/setup.zsh /home/oem/Vscode/work/cam/devel/./setup.zsh
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/local_setup.zsh /home/oem/Vscode/work/cam/devel/./local_setup.zsh
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/setup.bash /home/oem/Vscode/work/cam/devel/./setup.bash
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/share/catkin_tools_prebuild/cmake/catkin_tools_prebuildConfig-version.cmake /home/oem/Vscode/work/cam/devel/share/catkin_tools_prebuild/cmake/catkin_tools_prebuildConfig-version.cmake
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/share/catkin_tools_prebuild/cmake/catkin_tools_prebuildConfig.cmake /home/oem/Vscode/work/cam/devel/share/catkin_tools_prebuild/cmake/catkin_tools_prebuildConfig.cmake
+/home/oem/Vscode/work/cam/devel/.private/catkin_tools_prebuild/lib/pkgconfig/catkin_tools_prebuild.pc /home/oem/Vscode/work/cam/devel/lib/pkgconfig/catkin_tools_prebuild.pc

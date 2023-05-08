@@ -12,12 +12,47 @@
 #include <sensor_msgs/Image.h>
 #include <std_msgs/Header.h>
 #include <sensor_msgs/image_encodings.h>
+#include <chrono>
+#include "../include/nvidia.hpp"
+#include <nppi.h>
 
 using namespace std;
+using namespace std::chrono;
 using namespace cv;
 using namespace cv::dnn;
+int source_dmabuf_fd = -1;
+int dest_dmabuf_fd_right = -1;
+int dest_dmabuf_fd_left = -1;
+NvBufSurface *src_nvbuf_surf = 0;
+NvBufSurface *tmpbuf = 0;
+NvBufSurface *dst_nvbuf_surf_left = 0;
+NvBufSurface *dst_nvbuf_surf_right = 0;
+NvBufSurface *src_tran_nvbuf_surf = 0;
+NvBufSurface *dst_tran_nvbuf_surf = 0;
+std::ofstream image;
+int image_a = 0;
+
+// debug
 
 #define MEMORY_ALLOT_ERROR -1
+#define CHECK_ERROR(condition, error_str)              \
+    if (condition)                                     \
+    {                                                  \
+        if (source_dmabuf_fd != -1)                    \
+        {                                              \
+            NvBufSurfaceDestroy(src_nvbuf_surf);       \
+            source_dmabuf_fd = -1;                     \
+        }                                              \
+        if (dest_dmabuf_fd_left != -1)                 \
+        {                                              \
+            NvBufSurfaceDestroy(dst_nvbuf_surf_left);  \
+            NvBufSurfaceDestroy(dst_nvbuf_surf_right); \
+            dest_dmabuf_fd_left = -1;                  \
+            dest_dmabuf_fd_right = -1;                 \
+        }                                              \
+        cudaStreamDestroy(config_params.cuda_stream);  \
+        throw std::runtime_error(error_str);           \
+    }
 
 GX_DEV_HANDLE g_device = NULL;    ///< 设备句柄
 GX_FRAME_DATA g_frame_data = {0}; ///< 采集图像参数
@@ -27,6 +62,17 @@ ros::Publisher pub_img_left;
 ros::Publisher pub_img_right;
 sensor_msgs::Image img_left, img_right;
 uchar *m_rgb_image = NULL; // 增加的内容
+
+// NVIDIA vpi
+NvBufSurfaceAllocateParams input_params = {{0}};
+NvBufSurfaceAllocateParams output_params_left = {{0}};
+NvBufSurfaceAllocateParams output_params_right = {{0}};
+NvBufSurfTransformParams transform_params_left = {0};
+NvBufSurfTransformParams transform_params_right = {0};
+NvBufSurfTransformRect src_rect_left = {0}, dest_rect_left = {0};
+NvBufSurfTransformRect src_rect_right = {0}, dest_rect_right = {0};
+NvBufSurfTransformConfigParams config_params = {NvBufSurfTransformCompute_VIC, 0, NULL};
+
 // 获取图像大小并申请图像数据空间
 int PreForImage();
 
@@ -46,43 +92,135 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "cam");
     ros::NodeHandle n;
+    image.open("/home/image.txt");
 
-    pub_img_left = n.advertise<sensor_msgs::Image>("/image/left", 1000);
-    pub_img_right = n.advertise<sensor_msgs::Image>("/image/right", 1000);
+    pub_img_left = n.advertise<sensor_msgs::Image>("/image/left", 1);
+    pub_img_right = n.advertise<sensor_msgs::Image>("/image/right", 1);
 
-    uid_t user = 0;
-    user = geteuid();
-    if (user != 0)
-    {
-        printf("\n");
-        printf("Please run this application with 'sudo -E ./GxAcquireContinuous' or"
-               " Start with root !\n");
-        printf("\n");
-        return 0;
-    }
+    int width = 2560;
+    int height = 1024;
 
-    printf("\n");
-    printf("-------------------------------------------------------------\n");
-    printf("sample to show how to acquire image continuously.\n");
-#ifdef __x86_64__
-    printf("version: 1.0.1605.8041\n");
-#elif __i386__
-    printf("version: 1.0.1605.9041\n");
-#endif
-    printf("-------------------------------------------------------------\n");
-    printf("\n");
+    input_params.params.width = width;
+    input_params.params.height = height;
+    input_params.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    input_params.params.gpuId = 0;
+    input_params.params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
+    input_params.memtag = NvBufSurfaceTag_NONE;
 
-    printf("Press [x] or [X] and then press [Enter] to Exit the Program\n");
-    printf("Initializing......");
-    printf("\n\n");
+    // input_tran_params.params.width = width;
+    // input_tran_params.params.height = height;
+    // input_tran_params.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    // input_tran_params.params.gpuId = 0;
+    // input_tran_params.params.colorFormat = NVBUF_COLOR_FORMAT_BGRA;
+    // input_tran_params.memtag = NvBufSurfaceTag_VIDEO_CONVERT;
 
-    usleep(2000000);
+    // output_tran_params.params.width = width;
+    // output_tran_params.params.height = height;
+    // output_tran_params.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    // output_tran_params.params.gpuId = 0;
+    // output_tran_params.params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
+    // output_tran_params.memtag = NvBufSurfaceTag_VIDEO_CONVERT;
+
+    output_params_left.params.width = width / 2;
+    output_params_left.params.height = height;
+    output_params_left.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    output_params_left.params.gpuId = 0;
+    output_params_left.params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
+    output_params_left.memtag = NvBufSurfaceTag_NONE;
+
+    output_params_right.params.width = width / 2;
+    output_params_right.params.height = height;
+    output_params_right.params.memType = NVBUF_MEM_SURFACE_ARRAY;
+    output_params_right.params.gpuId = 0;
+    output_params_right.params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
+    output_params_right.memtag = NvBufSurfaceTag_NONE;
+
+    // fill_bytes_per_pixel(input_params.params.colorFormat, bytes_per_pixel_srcfmt);
+    // fill_bytes_per_pixel(output_params.params.colorFormat, bytes_per_pixel_destfmt);
+
+    /* Create the HW Buffer. It is exported as
+    ** an FD by the hardware.
+    */
+    int ret = NvBufSurfaceAllocate(&src_nvbuf_surf, 1, &input_params);
+    CHECK_ERROR(ret, "Error in creating the source buffer.");
+    src_nvbuf_surf->numFilled = 1;
+    source_dmabuf_fd = src_nvbuf_surf->surfaceList[0].bufferDesc;
+
+    // ret = NvBufSurfaceAllocate(&src_tran_nvbuf_surf, 1, &input_tran_params);
+    // CHECK_ERROR(ret, "Error in creating the source buffer.");
+    // src_tran_nvbuf_surf->numFilled = 1;
+
+    // ret = NvBufSurfaceAllocate(&dst_tran_nvbuf_surf, 1, &output_tran_params);
+    // CHECK_ERROR(ret, "Error in creating the destination buffer.");
+    // dst_tran_nvbuf_surf->numFilled = 1;
+
+    ret = NvBufSurfaceAllocate(&dst_nvbuf_surf_left, 1, &output_params_left);
+    CHECK_ERROR(ret, "Error in creating the destination buffer.");
+    dst_nvbuf_surf_left->numFilled = 1;
+    dest_dmabuf_fd_left = dst_nvbuf_surf_left->surfaceList[0].bufferDesc;
+
+    ret = NvBufSurfaceAllocate(&dst_nvbuf_surf_right, 1, &output_params_right);
+    CHECK_ERROR(ret, "Error in creating the destination buffer.");
+    dst_nvbuf_surf_right->numFilled = 1;
+    dest_dmabuf_fd_right = dst_nvbuf_surf_right->surfaceList[0].bufferDesc;
+
+    config_params.gpu_id = 0;
+    config_params.compute_mode = NvBufSurfTransformCompute_GPU;
+    cudaStreamCreateWithFlags(&(config_params.cuda_stream), cudaStreamNonBlocking);
+
+    /* Set the session parameters */
+    ret = NvBufSurfTransformSetSessionParams(&config_params);
+    CHECK_ERROR(ret, "Error in NvBufSurfTransformSetSessionParams");
+
+    /* Transformation parameters are now defined
+    ** which is passed to the NvBuuferTransform
+    ** for required conversion.
+    */
+
+    src_rect_left.top = 0;
+    src_rect_left.left = 0;
+    src_rect_left.width = width / 2;
+    src_rect_left.height = height;
+    dest_rect_left.top = 0;
+    dest_rect_left.left = 0;
+    dest_rect_left.width = width / 2;
+    dest_rect_left.height = height;
+
+    src_rect_right.top = 0;
+    src_rect_right.left = width / 2;
+    src_rect_right.width = width / 2;
+    src_rect_right.height = height;
+    dest_rect_right.top = 0;
+    dest_rect_right.left = 0;
+    dest_rect_right.width = width / 2;
+    dest_rect_right.height = height;
+
+    /* @transform_flag defines the flags for
+    ** enabling the valid transforms.
+    ** All the valid parameters are present in
+    ** the nvbufsurface header.
+    */
+
+    memset(&transform_params_left, 0, sizeof(transform_params_left));
+    transform_params_left.transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC;
+    transform_params_left.transform_flip = NvBufSurfTransform_None;
+    transform_params_left.transform_filter = NvBufSurfTransformInter_Nearest;
+    transform_params_left.src_rect = &src_rect_left;
+    transform_params_left.dst_rect = &dest_rect_left;
+
+    memset(&transform_params_right, 0, sizeof(transform_params_right));
+    transform_params_right.transform_flag = NVBUFSURF_TRANSFORM_CROP_SRC; // NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_FLIP;
+    transform_params_right.transform_flip = NvBufSurfTransform_None;
+    transform_params_right.transform_filter = NvBufSurfTransformInter_Nearest;
+    transform_params_right.src_rect = &src_rect_right;
+    transform_params_right.dst_rect = &dest_rect_right;
+
+    // usleep(1000000);
 
     // API接口函数返回值
     GX_STATUS status = GX_STATUS_SUCCESS;
 
     uint32_t device_num = 0;
-    uint32_t ret = 0;
     GX_OPEN_PARAM open_param;
 
     // 初始化设备打开参数，默认打开序号为1的设备
@@ -164,7 +302,7 @@ int main(int argc, char **argv)
     // 设置曝光模式
     status = GXSetEnum(g_device, GX_ENUM_EXPOSURE_MODE,
                        GX_EXPOSURE_MODE_TIMED);
-    //设置曝光时间
+    // 设置曝光时间
     double shutterTime = 30000.0;
     status = GXSetFloat(g_device, GX_FLOAT_EXPOSURE_TIME,
                         shutterTime);
@@ -182,24 +320,24 @@ int main(int argc, char **argv)
         return 0;
     }
     // 启动接收线程
-    m_rgb_image = new uchar[2560 * 1024 * 3];
+    m_rgb_image = new uchar[2560 * 1024];
     ret = pthread_create(&g_acquire_thread, 0, ProcGetImage, 0);
     // 左图
     img_left.header.frame_id = "cam";
-    img_left.height = 512;
-    img_left.width = 640;
-    img_left.encoding = "bgr8";
+    img_left.height = 1024;
+    img_left.width = 1280;
+    img_left.encoding = "mono8";
     img_left.is_bigendian = false;
-    img_left.step = 640 * 3;
-    img_left.data.resize(img_left.step * 512);
+    img_left.step = 1280;
+    img_left.data.resize(img_left.step * 1024);
     // 右图
     img_right.header.frame_id = "cam";
-    img_right.height = 512;
-    img_right.width = 640;
-    img_right.encoding = "bgr8";
+    img_right.height = 1024;
+    img_right.width = 1280;
+    img_right.encoding = "mono8";
     img_right.is_bigendian = false;
-    img_right.step = 640 * 3;
-    img_right.data.resize(img_right.step * 512);
+    img_right.step = 1280;
+    img_right.data.resize(img_right.step * 1024);
     if (ret != 0)
     {
         printf("<Failed to create the collection thread>\n");
@@ -221,6 +359,7 @@ int main(int argc, char **argv)
 
     // 释放库
     status = GXCloseLib();
+
     return 0;
 }
 
@@ -236,6 +375,7 @@ int PreForImage()
     int64_t payload_size;
 
     status = GXGetInt(g_device, GX_INT_PAYLOAD_SIZE, &payload_size);
+    std::cout << payload_size << std::endl;
     if (status != GX_STATUS_SUCCESS)
     {
         GetErrorString(status);
@@ -311,27 +451,82 @@ void *ProcGetImage(void *pParam)
     }
     while (g_get_image)
     {
+        // std::cout << "aaaa" << std::endl;
         if (g_frame_data.pImgBuf == NULL)
         {
             continue;
         }
-
-        status = GXGetImage(g_device, &g_frame_data, 100);
+        status = GXGetImage(g_device, &g_frame_data, 1000);
         if (status == GX_STATUS_SUCCESS)
         {
             if (g_frame_data.nStatus == 0)
             {
+                auto start = system_clock::now();
                 // 左图
                 img_left.header.stamp = ros::Time::now();
                 // 右图
                 img_right.header.stamp = ros::Time::now();
-                // 修改这个的高和宽是否可以直接改变图像大小？
-                DxRaw8toRGB24(g_frame_data.pImgBuf, m_rgb_image, g_frame_data.nWidth, g_frame_data.nHeight, RAW2RGB_NEIGHBOUR, DX_PIXEL_COLOR_FILTER(BAYERBG), false);
-                // memcpy(reinterpret_cast<uchar *>(&img.data[0]), m_rgb_image, g_frame_data.nWidth * g_frame_data.nHeight * 3);
-                resize_spilt(reinterpret_cast<uchar *>(&img_right.data[0]), reinterpret_cast<uchar *>(&img_left.data[0]), m_rgb_image, g_frame_data.nWidth, g_frame_data.nHeight);
-                // 图像分割直接半行半行memcpy
-                pub_img_right.publish(img_right);
+
+                int ret = 0;
+
+                /* Void data pointer to store memory-mapped
+                ** virtual addresses of the planes.
+                */
+                void *virtualip_data_addr;
+                unsigned int plane = 0;
+                Raw2NvBufSurface((u_char *)g_frame_data.pImgBuf, 0, 0, 2560, 1024, src_nvbuf_surf);
+
+                ret = NvBufSurfTransform(src_nvbuf_surf, dst_nvbuf_surf_left, &transform_params_left);
+                CHECK_ERROR(ret, "Error in transformation.");
+
+                ret = NvBufSurfTransform(src_nvbuf_surf, dst_nvbuf_surf_right, &transform_params_right);
+                CHECK_ERROR(ret, "Error in transformation.");
+                // copy
+                // ret = NvBufSurfaceCopy(dst_tran_nvbuf_surf, dst_nvbuf_surf);
+                // CHECK_ERROR(ret, "Error in NvBufSurfaceCopy");
+
+                // 转出去
+                NvBufSurface *nvbuf_surf_out_left = 0;
+
+                ret = NvBufSurfaceFromFd(dest_dmabuf_fd_left, (void **)(&nvbuf_surf_out_left));
+                CHECK_ERROR(ret, "NvBufSurfaceFromFd failed");
+
+                NvBufSurface *nvbuf_surf_out_right = 0;
+                ret = NvBufSurfaceFromFd(dest_dmabuf_fd_right, (void **)(&nvbuf_surf_out_right));
+                CHECK_ERROR(ret, "NvBufSurfaceFromFd failed");
+
+                /* Void data pointer to store memory-mapped
+                ** virtual addresses of the planes.
+                */
+
+                // void *virtualop_data_addr;
+                // for (plane = 0; plane < nvbuf_surf_out->surfaceList[0].planeParams.num_planes; ++plane)
+                // {
+                //     ret = NvBufSurfaceMap(nvbuf_surf_out, 0, plane, NVBUF_MAP_READ);
+                //     if (ret == 0)
+                //     {
+                //         // NvBufSurfaceSyncForCpu(nvbuf_surf_out, 0, plane);
+                //         virtualop_data_addr = (void *)nvbuf_surf_out->surfaceList[0].mappedAddr.addr[plane];
+
+                //         memcpy(reinterpret_cast<uchar *>(&img_left.data[0]), (char *)virtualop_data_addr, 1024 * 2560);
+                //     }
+                //     else
+                //     {
+                //         std::cout << "out error" << std::endl;
+                //     }
+                //     NvBufSurfaceUnMap(nvbuf_surf_out, 0, plane);
+                // }
+                NvBufSurface2Raw(nvbuf_surf_out_left, 0, 0, 1280, 1024, reinterpret_cast<uchar *>(&img_left.data[0]));
+                NvBufSurface2Raw(nvbuf_surf_out_right, 0, 0, 1280, 1024, reinterpret_cast<uchar *>(&img_right.data[0]));
                 pub_img_left.publish(img_left);
+                pub_img_right.publish(img_right);
+                // std::cout << "image_a" << image_a << std::endl;
+                auto end = system_clock::now();
+                auto duration = duration_cast<microseconds>(end - start);
+                cout << "花费了"
+                     << double(duration.count()) * microseconds::period::num / microseconds::period::den << "秒" << endl;
+
+                image_a++;
             }
         }
     }

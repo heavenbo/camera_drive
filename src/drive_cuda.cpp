@@ -8,47 +8,41 @@
 #include <sstream>
 #include <fstream>
 #include <opencv2/opencv.hpp>
-
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <std_msgs/Header.h>
 #include <sensor_msgs/image_encodings.h>
-#include <sensor_msgs/CameraInfo.h>
-
-#include <mavros_msgs/CamIMUStamp.h>
-#include <mutex>
-
+#include <jetson-utils/cudaMappedMemory.h>
+#include <jetson-utils/cudaColorspace.h>
+#include <jetson-utils/imageIO.h>
+#include <nppi.h>
+#include <cuda_runtime_api.h>
+#include <chrono>
 using namespace std;
 using namespace cv;
 using namespace cv::dnn;
+int image_a = 0;
+
+// debug
 
 #define MEMORY_ALLOT_ERROR -1
-
-uchar g_GammaLUT[256];            // 全局数组：包含256个元素的gamma校正查找表
 GX_DEV_HANDLE g_device = NULL;    ///< 设备句柄
 GX_FRAME_DATA g_frame_data = {0}; ///< 采集图像参数
 pthread_t g_acquire_thread = 0;   ///< 采集线程ID
-pthread_t Sync_thread = 1;
+bool g_get_image = false;         ///< 采集线程是否结束的标志：true 运行；false 退出
 ros::Publisher pub_img_left;
 ros::Publisher pub_img_right;
 ros::Publisher pub_img_left_gray;
 ros::Publisher pub_img_right_gray;
-
-std::mutex mtx_id, mtx_photo; // 定义互斥锁
-ros::Subscriber sub_time;
-ros::Time tmp_time;
-std::queue<uint32_t> id_q;
-std::queue<ros::Time> time_q;
-std::queue<sensor_msgs::Image> photo_left_q, photo_right_q;
-uint32_t id_image = 0;
-
 sensor_msgs::Image img_left, img_right;
 sensor_msgs::Image img_left_gray, img_right_gray;
-sensor_msgs::Image *img_left_gray_p;
-sensor_msgs::Image *img_right_gray_p;
-sensor_msgs::CameraInfo cam;
-
-uchar *m_rgb_image = NULL; // 增加的内容
+u_char *dst_left;
+u_char *dst_right;
+u_char *left_gray;
+u_char *right_gray;
+u_char *tmp_color;
+u_char *left_gamma;
+u_char *right_gamma;
 
 // 获取图像大小并申请图像数据空间
 int PreForImage();
@@ -64,84 +58,28 @@ void GetErrorString(GX_STATUS error_status);
 
 inline void spilt(uchar *img_1, uchar *img_2, const uchar *imgraw, size_t nWidth, size_t nHeight);
 void resize_spilt(uchar *img_1, uchar *img_2, const uchar *imgraw, size_t nWidth, size_t nHeight);
-void rbg24togray(uchar *imgrgb, uchar *imggray, size_t nWidth, size_t nHeight);
-void GammaCorrectiom(uchar *src, int iWidth, int iHeight, uchar *Dst);
-void BuildTable(float fPrecompensation);
-void Time_callback(const mavros_msgs::CamIMUStampConstPtr &cam_stamp)
-{
-    mtx_id.lock();
-    id_q.push(cam_stamp->frame_seq_id);
-    time_q.push(cam_stamp->frame_stamp);
-    mtx_id.unlock();
-}
-void *Sync_gray(void *param)
-{
-    while (ros::ok() && !id_q.empty() && !photo_left_q.empty())
-    {
-        mtx_id.lock();
-        if (!time_q.empty())
-        {
-            tmp_time = time_q.front();
-            time_q.pop();
-        }
-        if (id_q.size() > 1024)
-        {
-            ROS_ERROR("exit!The length of queue exceeds 1024!");
-            exit(0);
-        }
-        else if (id_q.empty())
-        {
-            ROS_WARN("id is empty,img is no stamp!");
-        }
-        else
-        {
-            ROS_DEBUG("The image_id:%d", (int)id_q.front());
-            if (id_image != id_q.front())
-            {
-                ROS_WARN("not sync,%d", id_image - id_q.front());
-            }
-            id_q.pop();
-        }
-        mtx_id.unlock();
-        mtx_photo.lock();
-        img_left_gray_p = &photo_left_q.front();
-        img_right_gray_p = &photo_right_q.front();
-        // 左图灰度图
-        img_left_gray_p->header.stamp = tmp_time;
-        // 右图灰度图
-        img_right_gray_p->header.stamp = tmp_time;
-        pub_img_left_gray.publish(*img_right_gray_p);
-        pub_img_right_gray.publish(*img_left_gray_p);
-        photo_left_q.pop();
-        photo_right_q.pop();
-        id_image++;
-        mtx_photo.unlock();
-    }
-    return 0;
-}
+
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "cam");
     ros::NodeHandle n;
-
-    pub_img_left = n.advertise<sensor_msgs::Image>("/image/left", 1000);
-    pub_img_right = n.advertise<sensor_msgs::Image>("/image/right", 1000);
-    pub_img_left_gray = n.advertise<sensor_msgs::Image>("/image/left_gray", 1000);
-    pub_img_right_gray = n.advertise<sensor_msgs::Image>("/image/right_gray", 1000);
-
-    sub_time = n.subscribe<mavros_msgs::CamIMUStamp>("mavros/sync/cam_imu_stamp", 100, Time_callback);
-
-    BuildTable(1.0 / 1.8);
-    printf("Initializing......");
-    printf("\n\n");
-
+    cudaMallocManaged(&tmp_color, 2560 * 1024 * 24);
+    cudaMallocManaged(&dst_right, 960 * 768 * 24);
+    cudaMallocManaged(&dst_left, 960 * 768 * 24);
+    cudaMallocManaged(&right_gray, 960 * 768 * 8);
+    cudaMallocManaged(&left_gray, 960 * 768 * 8);
+    cudaMallocManaged(&right_gamma, 960 * 768 * 24);
+    cudaMallocManaged(&left_gamma, 960 * 768 * 24);
+    pub_img_left = n.advertise<sensor_msgs::Image>("/cam/left/bgr", 1000);
+    pub_img_right = n.advertise<sensor_msgs::Image>("/cam/right/bgr", 1000);
+    pub_img_left_gray = n.advertise<sensor_msgs::Image>("/cam/left/gray", 1000);
+    pub_img_right_gray = n.advertise<sensor_msgs::Image>("/cam/right/gray", 1000);
     usleep(1000000);
 
     // API接口函数返回值
     GX_STATUS status = GX_STATUS_SUCCESS;
 
     uint32_t device_num = 0;
-    uint32_t ret = 0;
     GX_OPEN_PARAM open_param;
 
     // 初始化设备打开参数，默认打开序号为1的设备
@@ -180,15 +118,13 @@ int main(int argc, char **argv)
     // 设置最小增益值
     status = GXSetEnum(g_device, GX_ENUM_GAIN_SELECTOR,
                        GX_GAIN_SELECTOR_ALL);
-    status = GXSetFloat(g_device, GX_FLOAT_GAIN, 0);
+    status = GXSetFloat(g_device, GX_FLOAT_GAIN, 3);
 
     // 设置白平衡系数
     status = GXSetEnum(g_device, GX_ENUM_BALANCE_RATIO_SELECTOR,
                        GX_BALANCE_RATIO_SELECTOR_BLUE);
     double B = 1.424984;
     double R = 0.988648;
-    //     double B = 1;
-    // double R = 1;
     status = GXSetFloat(g_device, GX_FLOAT_BALANCE_RATIO,
                         B);
 
@@ -226,27 +162,11 @@ int main(int argc, char **argv)
     status = GXSetEnum(g_device, GX_ENUM_EXPOSURE_MODE,
                        GX_EXPOSURE_MODE_TIMED);
     // 设置曝光时间
-    // double shutterTime = 11111.1;
     double shutterTime = 30000.0;
     status = GXSetFloat(g_device, GX_FLOAT_EXPOSURE_TIME,
                         shutterTime);
-    // 举例引脚选择为 Line3
-    status = GXSetEnum(g_device, GX_ENUM_LINE_SELECTOR,
-                       GX_ENUM_LINE_SELECTOR_LINE3);
-    // 设置引脚方向为输出
-    status = GXSetEnum(g_device, GX_ENUM_LINE_MODE,
-                       GX_ENUM_LINE_MODE_OUTPUT);
-    // 可选操作引脚电平反转
-    status = GXSetBool(g_device, GX_BOOL_LINE_INVERTER, true);
-    // 如果设置输出源为闪光灯,则如下代码
-    status = GXSetEnum(g_device, GX_ENUM_LINE_SOURCE,
-                       GX_ENUM_LINE_SOURCE_STROBE);
-    // 设置采集帧率
-    status = GXSetEnum(g_device, GX_ENUM_ACQUISITION_FRAME_RATE_MODE,
-                       GX_ACQUISITION_FRAME_RATE_MODE_ON);
-    status = GXSetFloat(g_device, GX_FLOAT_ACQUISITION_FRAME_RATE, 30);
     // 为采集做准备
-    ret = PreForImage();
+    int ret = PreForImage();
     if (ret != 0)
     {
         printf("<Failed to prepare for acquire image>\n");
@@ -259,57 +179,40 @@ int main(int argc, char **argv)
         return 0;
     }
     // 启动接收线程
-    m_rgb_image = new uchar[2560 * 1024 * 3];
     ret = pthread_create(&g_acquire_thread, 0, ProcGetImage, 0);
-    if (ret != 0)
-    {
-        printf("<Failed to create the collection thread>\n");
-        status = GXCloseDevice(g_device);
-        if (g_device != NULL)
-        {
-            g_device = NULL;
-        }
-        status = GXCloseLib();
-        return 0;
-    }
     // 左图
-    img_left.header.frame_id = "cam0";
-    img_left.height = 512;
-    img_left.width = 640;
-    img_left.encoding = "bgr8";
+    img_left.header.frame_id = "cam";
+    img_left.width = 960;
+    img_left.height = 768;
+    img_left.encoding = "rgb8";
     img_left.is_bigendian = false;
-    img_left.step = 640 * 3;
-    img_left.data.resize(img_left.step * 512);
+    img_left.step = 960 * 3;
+    img_left.data.resize(img_left.step * 768);
     // 右图
-    img_right.header.frame_id = "cam1";
-    img_right.height = 512;
-    img_right.width = 640;
-    img_right.encoding = "bgr8";
+    img_right.header.frame_id = "cam";
+    img_right.width = 960;
+    img_right.height = 768;
+    img_right.encoding = "rgb8";
     img_right.is_bigendian = false;
-    img_right.step = 640 * 3;
-    img_right.data.resize(img_right.step * 512);
+    img_right.step = 960 * 3;
+    img_right.data.resize(img_left.step * 768);
     // 左图灰度
     img_left_gray.header.frame_id = "cam0";
-    img_left_gray.height = 512;
-    img_left_gray.width = 640;
+    img_left_gray.height = 768;
+    img_left_gray.width = 960;
     img_left_gray.encoding = "mono8";
     img_left_gray.is_bigendian = false;
-    img_left_gray.step = 640;
-    img_left_gray.data.resize(img_left_gray.step * 512);
+    img_left_gray.step = 960;
+    img_left_gray.data.resize(img_left_gray.step * 768);
     // 右图灰度
     img_right_gray.header.frame_id = "cam1";
-    img_right_gray.height = 512;
-    img_right_gray.width = 640;
+    img_right_gray.width = 960;
+    img_right_gray.height = 768;
     img_right_gray.encoding = "mono8";
     img_right_gray.is_bigendian = false;
-    img_right_gray.step = 640;
-    img_right_gray.data.resize(img_right_gray.step * 512);
-    // 相机
-    cam.header.frame_id = "cam";
-    cam.height = 512;
-    cam.width = 640;
-
-    ret = pthread_create(&Sync_thread, 0, Sync_gray, 0);
+    img_right_gray.step = 960;
+    img_right_gray.data.resize(img_right_gray.step * 768);
+    // usleep(1000000);
     if (ret != 0)
     {
         printf("<Failed to create the collection thread>\n");
@@ -325,12 +228,13 @@ int main(int argc, char **argv)
     ros::spin();
     // 为停止采集做准备
     ret = UnPreForImage();
-    pthread_join(Sync_thread, NULL);
+
     // 关闭设备
     status = GXCloseDevice(g_device);
 
     // 释放库
     status = GXCloseLib();
+
     return 0;
 }
 
@@ -346,6 +250,7 @@ int PreForImage()
     int64_t payload_size;
 
     status = GXGetInt(g_device, GX_INT_PAYLOAD_SIZE, &payload_size);
+    std::cout << payload_size << std::endl;
     if (status != GX_STATUS_SUCCESS)
     {
         GetErrorString(status);
@@ -353,7 +258,8 @@ int PreForImage()
         return status;
     }
 
-    g_frame_data.pImgBuf = malloc(payload_size);
+    // g_frame_data.pImgBuf = malloc(payload_size * 4);
+    cudaMallocManaged(&g_frame_data.pImgBuf, 2560 * 1024 * 8, cudaMemAttachHost);
     if (g_frame_data.pImgBuf == NULL)
     {
         printf("<Failed to allot memory>\n");
@@ -381,6 +287,8 @@ int UnPreForImage()
         GetErrorString(status);
         return status;
     }
+
+    g_get_image = false;
     ret = pthread_join(g_acquire_thread, NULL);
     if (ret != 0)
     {
@@ -408,6 +316,8 @@ int UnPreForImage()
 void *ProcGetImage(void *pParam)
 {
     GX_STATUS status = GX_STATUS_SUCCESS;
+    // 接收线程启动标志
+    g_get_image = true;
 
     // 发送开采命令
     status = GXSendCommand(g_device, GX_COMMAND_ACQUISITION_START);
@@ -415,38 +325,70 @@ void *ProcGetImage(void *pParam)
     {
         GetErrorString(status);
     }
-    while (ros::ok())
+
+    while (g_get_image)
     {
+        // std::cout << "aaaa" << std::endl;
         if (g_frame_data.pImgBuf == NULL)
         {
             continue;
         }
-
+        auto start = std::chrono::system_clock::now();
         status = GXGetImage(g_device, &g_frame_data, 100);
+        auto end = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        std::cout << "cost: "
+                  << double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den << "秒" << std::endl;
         if (status == GX_STATUS_SUCCESS)
         {
             if (g_frame_data.nStatus == 0)
             {
-                // 修改这个的高和宽是否可以直接改变图像大小？
-                DxRaw8toRGB24(g_frame_data.pImgBuf, m_rgb_image, g_frame_data.nWidth, g_frame_data.nHeight, RAW2RGB_NEIGHBOUR, DX_PIXEL_COLOR_FILTER(BAYERBG), false);
-                // memcpy(reinterpret_cast<uchar *>(&img.data[0]), m_rgb_image, g_frame_data.nWidth * g_frame_data.nHeight * 3);
-                resize_spilt(&img_right.data[0], &img_left.data[0], m_rgb_image, g_frame_data.nWidth, g_frame_data.nHeight);
-                rbg24togray(reinterpret_cast<uchar *>(&img_right.data[0]), reinterpret_cast<uchar *>(&img_right_gray.data[0]), 640, 512);
-                rbg24togray(reinterpret_cast<uchar *>(&img_left.data[0]), reinterpret_cast<uchar *>(&img_left_gray.data[0]), 640, 512);
-                GammaCorrectiom(reinterpret_cast<uchar *>(&img_right_gray.data[0]), 640, 512, reinterpret_cast<uchar *>(&img_right_gray.data[0]));
-                GammaCorrectiom(reinterpret_cast<uchar *>(&img_left_gray.data[0]), 640, 512, reinterpret_cast<uchar *>(&img_left_gray.data[0]));
-
-                mtx_photo.lock();
-                photo_left_q.push(img_left_gray);
-                photo_right_q.push(img_right_gray);
-                mtx_photo.unlock();
                 // 左图
-                img_left.header.stamp = tmp_time;
+                img_left.header.stamp = ros::Time::now();
                 // 右图
-                img_right.header.stamp = tmp_time;
+                img_right.header.stamp = ros::Time::now();
+                // memcpy(src, g_frame_data.pImgBuf, 2560 * 1024);
+                // cudaStreamAttachMemAsync(NULL, (u_char *)g_frame_data.pImgBuf, 0, cudaMemAttachGlobal);
 
-                pub_img_left.publish(img_right);
-                pub_img_right.publish(img_left);
+                // nppiResize_8u_C1R(src, srcStep, size, roi,
+                //                   tmp, 1280, {1280, 512}, {0, 0, 1280, 512}, NPPI_INTER_NN);
+                nppiCFAToRGB_8u_C1C3R((u_char *)g_frame_data.pImgBuf, 2560, {2560, 1024}, {0, 0, 2560, 1024},
+                                      tmp_color, 2560 * 3,
+                                      NPPI_BAYER_RGGB, NPPI_INTER_UNDEFINED);
+
+                nppiResize_8u_C3R(tmp_color, 2560 * 3, {2560, 1024}, {0, 0, 1280, 1024},
+                                  dst_left, 960 * 3, {960, 768}, {0, 0, 960, 768}, NPPI_INTER_SUPER);
+
+                nppiResize_8u_C3R(tmp_color, 2560 * 3, {2560, 1024}, {1280, 0, 1280, 1024},
+                                  dst_right, 960 * 3, {960, 768}, {0, 0, 960, 768}, NPPI_INTER_SUPER);
+                // cudaStreamAttachMemAsync(NULL, dst_right, 0, cudaMemAttachGlobal);
+                // cudaStreamAttachMemAsync(NULL, dst_left, 0, cudaMemAttachGlobal);
+
+                nppiGammaFwd_8u_C3R(dst_left, 960 * 3, left_gamma, 960 * 3, {960, 768});
+                nppiGammaFwd_8u_C3R(dst_right, 960 * 3, right_gamma, 960 * 3, {960, 768});
+
+                nppiRGBToGray_8u_C3C1R(left_gamma, 960 * 3, left_gray, 960, {960, 768});
+                nppiRGBToGray_8u_C3C1R(right_gamma, 960 * 3, right_gray, 960, {960, 768});
+
+                // cudaStreamAttachMemAsync(NULL, dst_right, 0, cudaMemAttachHost);
+                // cudaStreamAttachMemAsync(NULL, dst_left, 0, cudaMemAttachHost);
+
+                // std::cout << "convert done" << std::endl;
+                // cudaStreamAttachMemAsync(NULL, (u_char *)g_frame_data.pImgBuf, 0, cudaMemAttachHost);
+
+                cudaStreamSynchronize(NULL);
+                memcpy(reinterpret_cast<uchar *>(&img_left_gray.data[0]), left_gray, 960 * 768);
+                memcpy(reinterpret_cast<uchar *>(&img_right_gray.data[0]), right_gray, 960 * 768);
+                memcpy(reinterpret_cast<uchar *>(&img_left.data[0]), dst_left, 960 * 768 * 3);
+                memcpy(reinterpret_cast<uchar *>(&img_right.data[0]), dst_right, 960 * 768 * 3);
+
+
+                pub_img_left.publish(img_left);
+                pub_img_right.publish(img_right);
+                pub_img_left_gray.publish(img_left_gray);
+                pub_img_right_gray.publish(img_right_gray);
+
+                image_a++;
             }
         }
     }
@@ -519,7 +461,7 @@ inline void spilt(uchar *img_1, uchar *img_2, const uchar *imgraw, size_t nWidth
     }
 }
 
-void resize_spilt(uint8_t *img_1, uint8_t *img_2, const uint8_t *imgraw, size_t nWidth, size_t nHeight)
+void resize_spilt(uchar *img_1, uchar *img_2, const uchar *imgraw, size_t nWidth, size_t nHeight)
 {
     if (NULL == img_1 || NULL == img_2 || NULL == imgraw)
     {
@@ -565,41 +507,5 @@ void resize_spilt(uint8_t *img_1, uint8_t *img_2, const uint8_t *imgraw, size_t 
             height += 2;
         }
         height = 0;
-    }
-}
-
-void rbg24togray(uchar *imgrgb, uchar *imggray, size_t nWidth, size_t nHeight)
-{
-    uchar *end = imgrgb + nWidth * nHeight * 3;
-    for (; imgrgb < end; imgrgb = imgrgb + 3, imggray++)
-    {
-        *imggray = (*imgrgb * 19595 + *(imgrgb + 1) * 38469 + *(imgrgb + 2) * 7472) >> 16;
-    }
-}
-
-void BuildTable(float fPrecompensation)
-{
-    int i;
-    float f;
-    for (i = 0; i < 256; i++)
-    {
-        f = (i + 0.5F) / 256;                    // 归一化
-        f = (float)pow(f, fPrecompensation);     // 预补偿
-        g_GammaLUT[i] = (uchar)(f * 256 - 0.5F); // 反归一化
-    }
-}
-
-void GammaCorrectiom(uchar *src, int iWidth, int iHeight, uchar *Dst)
-{
-    int iCols, iRows;
-    // 对图像的每个像素进行查找表矫正
-    for (iRows = 0; iRows < iHeight; iRows++)
-    {
-        int pixelsNums = iRows * iWidth;
-        for (iCols = 0; iCols < iWidth; iCols++)
-        {
-            // Dst[iRows*iWidth+iCols]=g_GammaLUT[src[iRows*iWidth+iCols]];
-            Dst[pixelsNums + iCols] = g_GammaLUT[src[pixelsNums + iCols]];
-        }
     }
 }
