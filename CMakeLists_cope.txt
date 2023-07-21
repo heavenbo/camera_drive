@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.11)
+project(gxcam)
+
+set(CMAKE_CXX_STANDARD 11)
+
+
+add_executable(origin include/origin.cpp)
+target_link_libraries(origin  gxiapi yaml-cpp -lpthread -lm)   
+# add_executable(save src/save.cpp)
+# target_link_libraries(save ${OpenCV_LIBS} ${catkin_LIBRARIES})                    
